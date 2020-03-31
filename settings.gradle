@@ -1,4 +1,4 @@
-include ':EventBus'
+include ':EventBus', ':Demo'
 include ':EventBusAnnotationProcessor'
 include ':EventBusTestJava'
 include ':EventBusTest'

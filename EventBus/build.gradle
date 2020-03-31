@@ -33,7 +33,9 @@ task javadocJar(type: Jar, dependsOn: javadoc) {
     classifier = 'javadoc'
     from 'build/docs/javadoc'
 }
-
+tasks.withType(JavaCompile) {
+    options.encoding = "UTF-8"
+}
 task sourcesJar(type: Jar) {
     from sourceSets.main.allSource
     classifier = 'sources'

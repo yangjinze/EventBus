@@ -15,13 +15,21 @@
  */
 package org.greenrobot.eventbus;
 
+/**
+ * 存放每个订阅者方法 与 订阅者对象
+ *
+ * 用于建立对象与方法的联系
+ */
 final class Subscription {
+    //订阅者对象 ， 比如 FirstActivity.class
     final Object subscriber;
+    //订阅者方法，@Subscribe标识的符合条件的方法
     final SubscriberMethod subscriberMethod;
     /**
      * Becomes false as soon as {@link EventBus#unregister(Object)} is called, which is checked by queued event delivery
      * {@link EventBus#invokeSubscriber(PendingPost)} to prevent race conditions.
      */
+    // 调用unregister后标志为false
     volatile boolean active;
 
     Subscription(Object subscriber, SubscriberMethod subscriberMethod) {

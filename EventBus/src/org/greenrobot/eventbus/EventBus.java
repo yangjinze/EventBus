@@ -45,10 +45,55 @@ public class EventBus {
     static volatile EventBus defaultInstance;
 
     private static final EventBusBuilder DEFAULT_BUILDER = new EventBusBuilder();
+
+    /**
+     *  缓存事件类型对应的继承体系和实现的接口列表，避免每次都重复解析获取
+     *
+     *  key : 发送的事件对应的class，比如 post("123")， key则为String.class
+     *  value : 事件class、事件实现的接口、事件的父类、父类实现的接口、父类的父类......这一连串有继承关系和接口实现关系的类集合
+     *
+     *  发送一个事件时，事件类型为其父类或者接口的订阅者方法也能被触发，比如：
+     *
+     *  假设A.class ,  B extends A , B implements C接口
+     *  @Subscribe()
+     *  public void subsA(A a) {}
+     *  @Subscribe()
+     *  public void subsC(C c) {}
+     *  @Subscribe()
+     *  public void subsB(B b) {}
+     *
+     *  则Post(B)的时候，上述3个订阅者方法都会被执行
+     */
     private static final Map<Class<?>, List<Class<?>>> eventTypesCache = new HashMap<>();
 
+    /**
+     * 存放订阅方法的接收的消息入参class -->  对应的订阅Subscription对象列表
+     *
+     *
+     * 作用：进行post(消息)的时候,根据 消息.class 就可以取出ubscription对象列表，然后逐一执行里面的订阅者方法
+     */
     private final Map<Class<?>, CopyOnWriteArrayList<Subscription>> subscriptionsByEventType;
+    /**
+     *  存放订阅者 -> 所拥有的订阅方法的入参class列表
+     *
+     *  订阅者: 调用register传入的对象， 比如 FirstActivity.this
+     *  订阅方法的入参class列表:
+     *    假设 FirstActivity 存在2个订阅者方法
+     *    @Subscribe
+     *    public void test(String msg)
+     *    @Subscribe
+     *    public void test(int type)
+     *    则对应列表[String.class, Integer.class]
+     *
+     *  作用： 下次根据unregister传入的对象，比如 FirstActivity.this就可以获取到列表 [String.class, Integer.class]
+     *  然后就可以从 subscriptionsByEventType 得到String.class 和 Integer.class对应的订阅方法对象列表
+     *  遍历订阅对象一致，则移除FirstActivity.this包含的所有订阅方法
+     */
     private final Map<Object, List<Class<?>>> typesBySubscriber;
+    /**
+     * 粘性事件缓存,比如postSticky("123")
+     * 则缓存String.class --> "123" ，可见对于每一个类型的事件只会缓存最新的粘性事件
+     */
     private final Map<Class<?>, Object> stickyEvents;
 
     private final ThreadLocal<PostingThreadState> currentPostingThreadState = new ThreadLocal<PostingThreadState>() {
@@ -139,7 +184,9 @@ public class EventBus {
      * ThreadMode} and priority.
      */
     public void register(Object subscriber) {
-        Class<?> subscriberClass = subscriber.getClass();
+        //subscriber订阅者，比如FirstActivity
+        Class<?> subscriberClass = subscriber.getClass(); //获取到订阅者的类型，比如FirstActivity.class
+        //获取订阅者中符合条件的@Subscribe标注的订阅者方法列表
         List<SubscriberMethod> subscriberMethods = subscriberMethodFinder.findSubscriberMethods(subscriberClass);
         synchronized (this) {
             for (SubscriberMethod subscriberMethod : subscriberMethods) {
@@ -148,45 +195,69 @@ public class EventBus {
         }
     }
 
+    /**
+     *
+     * @param subscriber        订阅者，调用register注册的对象，比如FirstActivity.this
+     * @param subscriberMethod  订阅者方法列表，比如FirstActivity.class中符合条件的@Subscribe标注的方法
+     */
     // Must be called in synchronized block
     private void subscribe(Object subscriber, SubscriberMethod subscriberMethod) {
-        Class<?> eventType = subscriberMethod.eventType;
+        Class<?> eventType = subscriberMethod.eventType;  //method，入参对应的class，比如String.class
+        //订阅对象， 存放订阅者对象与订阅方法对象 , FirstActivity.this 与 SubscriberMethod
         Subscription newSubscription = new Subscription(subscriber, subscriberMethod);
+        /***
+         * CopyOnWriteArrayList是线程安全的List
+         *
+         * 获取入参类型对应的订阅列表,这样可以在进行post的时候，直接根据发送的消息参数.class
+         * 获取到需要执行的订阅者方法了吧，逐一进行调用
+         * ***/
         CopyOnWriteArrayList<Subscription> subscriptions = subscriptionsByEventType.get(eventType);
         if (subscriptions == null) {
             subscriptions = new CopyOnWriteArrayList<>();
             subscriptionsByEventType.put(eventType, subscriptions);
         } else {
+            //TODO 这个判断怎么理解，为什么能实现效果
             if (subscriptions.contains(newSubscription)) {
                 throw new EventBusException("Subscriber " + subscriber.getClass() + " already registered to event "
                         + eventType);
             }
         }
 
+        //根据@Subscribe中参数priority指定的优先级存放找个订阅对象
         int size = subscriptions.size();
         for (int i = 0; i <= size; i++) {
+            //priority越大，优先级越高，放在越前面，更早被调用
             if (i == size || subscriberMethod.priority > subscriptions.get(i).subscriberMethod.priority) {
                 subscriptions.add(i, newSubscription);
                 break;
             }
         }
 
+        //缓存这个订阅者对象，比如FirstActivity.this，所拥有的订阅方法入参class列表
+        //作用可以参考typesBySubscriber属性注释
         List<Class<?>> subscribedEvents = typesBySubscriber.get(subscriber);
         if (subscribedEvents == null) {
+            //TODO ArrayList存在不妥的地方，应该用Set集合来避免添加了相同的Class
+            //不过一般一个订阅者也不会存在相同入参类型的订阅者方法
             subscribedEvents = new ArrayList<>();
             typesBySubscriber.put(subscriber, subscribedEvents);
         }
         subscribedEvents.add(eventType);
 
+        //处理粘性事件，有符合事件类型的，则执行
+        //注意的是这边粘性事件执行完，并不会从缓存中清除粘性事件，也就是下次再次注册或者有相关事件类型的定义方法注册时，都会再次执行这个粘性事件。
+        //粘性事件的删除需要主动删除，因为毕竟框架不清楚到底这个粘性事件有多少地方需要执行
         if (subscriberMethod.sticky) {
-            if (eventInheritance) {
+            if (eventInheritance) {//默认是true
                 // Existing sticky events of all subclasses of eventType have to be considered.
                 // Note: Iterating over all events may be inefficient with lots of sticky events,
                 // thus data structure should be changed to allow a more efficient lookup
                 // (e.g. an additional map storing sub classes of super classes: Class -> List<Class>).
+
                 Set<Map.Entry<Class<?>, Object>> entries = stickyEvents.entrySet();
                 for (Map.Entry<Class<?>, Object> entry : entries) {
                     Class<?> candidateEventType = entry.getKey();
+                    //eventType是candidateEventType的父类，或者2者同一类型时，返回true
                     if (eventType.isAssignableFrom(candidateEventType)) {
                         Object stickyEvent = entry.getValue();
                         checkPostStickyEventToSubscription(newSubscription, stickyEvent);
@@ -223,11 +294,14 @@ public class EventBus {
 
     /** Only updates subscriptionsByEventType, not typesBySubscriber! Caller must update typesBySubscriber. */
     private void unsubscribeByEventType(Object subscriber, Class<?> eventType) {
+        //获取入参class所对应的订阅方法对象列表
         List<Subscription> subscriptions = subscriptionsByEventType.get(eventType);
         if (subscriptions != null) {
             int size = subscriptions.size();
+            //TODO 列表遍历删除的一种实现方式，与迭代器的删除方式比较下
             for (int i = 0; i < size; i++) {
                 Subscription subscription = subscriptions.get(i);
+                //如果这个订阅者方法是该subscriber所有的，则进行移除
                 if (subscription.subscriber == subscriber) {
                     subscription.active = false;
                     subscriptions.remove(i);
@@ -239,31 +313,45 @@ public class EventBus {
     }
 
     /** Unregisters the given subscriber from all event classes. */
+    /**
+     * 取消注册，并且清除对应的订阅方法列表
+     * 避免一直缓存了该对象，导致内存泄漏
+     *
+     * @param subscriber
+     */
     public synchronized void unregister(Object subscriber) {
+        //获取该对象，比如FirstActivity.this所拥有的订阅方法消息入参class列表
         List<Class<?>> subscribedTypes = typesBySubscriber.get(subscriber);
         if (subscribedTypes != null) {
+            //遍历入参class列表
             for (Class<?> eventType : subscribedTypes) {
+                //传入订阅者对象，与入参class
                 unsubscribeByEventType(subscriber, eventType);
             }
+            //移除缓存的这个对象与列表
             typesBySubscriber.remove(subscriber);
         } else {
             logger.log(Level.WARNING, "Subscriber to unregister was not registered before: " + subscriber.getClass());
         }
     }
-
+     //发送给定的事件到消息事件总线
     /** Posts the given event to the event bus. */
     public void post(Object event) {
+        //TODO 这种缓存池实现用法了解
         PostingThreadState postingState = currentPostingThreadState.get();
         List<Object> eventQueue = postingState.eventQueue;
+        //事件队列
         eventQueue.add(event);
 
         if (!postingState.isPosting) {
+            //TODO isMainThread??? 当前是否在主线程
             postingState.isMainThread = isMainThread();
             postingState.isPosting = true;
             if (postingState.canceled) {
                 throw new EventBusException("Internal error. Abort state was not reset");
             }
             try {
+                //先进先出，按顺序处理事件
                 while (!eventQueue.isEmpty()) {
                     postSingleEvent(eventQueue.remove(0), postingState);
                 }
@@ -302,9 +390,11 @@ public class EventBus {
      * event of an event's type is kept in memory for future access by subscribers using {@link Subscribe#sticky()}.
      */
     public void postSticky(Object event) {
+        //缓存粘性事件
         synchronized (stickyEvents) {
             stickyEvents.put(event.getClass(), event);
         }
+        //执行正常的事件发送
         // Should be posted after it is putted, in case the subscriber wants to remove immediately
         post(event);
     }
@@ -376,10 +466,22 @@ public class EventBus {
         return false;
     }
 
+    /**
+     * 发送一个事件
+     *
+     * @param event  要发送的事件,EventBus.getDefault().post(event);
+     * @param postingState
+     * @throws Error
+     */
     private void postSingleEvent(Object event, PostingThreadState postingState) throws Error {
+        //event要发送的事件对象， 获取事件class类型，比如String.class
         Class<?> eventClass = event.getClass();
         boolean subscriptionFound = false;
+        //TODO eventInheritance作用？， 一开始默认是true
         if (eventInheritance) {
+            //递归获取事件class类型的相关父类，实现的接口，父类实现的接口
+            //也就是说相应入参为父类、实现的接口的订阅方法，都能被调用到
+            // 事件class > 接口 > 父类 > 父类接口 > 父类的父类 > 父类的父类接口.....
             List<Class<?>> eventTypes = lookupAllEventTypes(eventClass);
             int countTypes = eventTypes.size();
             for (int h = 0; h < countTypes; h++) {
@@ -400,17 +502,28 @@ public class EventBus {
         }
     }
 
+    /**
+     * 发送事件
+     *
+     * @param event         事件对象 ,比如post("123")，则为"123"
+     * @param postingState
+     * @param eventClass    事件类型， "123"对应String.class ， 看调用的地方，也可能为其父类或者实现的接口
+     * @return
+     */
     private boolean postSingleEventForEventType(Object event, PostingThreadState postingState, Class<?> eventClass) {
         CopyOnWriteArrayList<Subscription> subscriptions;
         synchronized (this) {
+            //获取该事件类型对应的订阅方法对象列表
             subscriptions = subscriptionsByEventType.get(eventClass);
         }
         if (subscriptions != null && !subscriptions.isEmpty()) {
+            //Subscription存放每个订阅者方法 与 订阅者对象
             for (Subscription subscription : subscriptions) {
                 postingState.event = event;
                 postingState.subscription = subscription;
                 boolean aborted;
                 try {
+                    //将事件传递给订阅方法@Subscribe
                     postToSubscription(subscription, event, postingState.isMainThread);
                     aborted = postingState.canceled;
                 } finally {
@@ -427,19 +540,24 @@ public class EventBus {
         return false;
     }
 
+    //TODO mainThreadPoster、backgroundPoster、asyncPoster实现了解下
     private void postToSubscription(Subscription subscription, Object event, boolean isMainThread) {
+        //根据@Subscribe里面threadMode所指定的线程做处理
         switch (subscription.subscriberMethod.threadMode) {
-            case POSTING:
+            case POSTING://默认的运行方式，运行在与发送方(post调用所在的线程)相同的线程，堵塞并直接执行
+                //堵塞并执行的意思是，post之后立马执行订阅者方法后，再接着执行post后面的代码
                 invokeSubscriber(subscription, event);
                 break;
-            case MAIN:
-                if (isMainThread) {
+            case MAIN://运行在主线程
+                if (isMainThread) {//如果当前post发送方就是在主线程，堵塞并直接执行
                     invokeSubscriber(subscription, event);
-                } else {
+                } else {//如果当前post发送方不在主线程，最终由handler切换到主线程执行
                     mainThreadPoster.enqueue(subscription, event);
                 }
                 break;
-            case MAIN_ORDERED:
+            case MAIN_ORDERED://运行在主线程
+                //与main的区别在于，MAIN_ORDERED都是排队执行，如果发送方当前是主线程的话，不会堵塞当前线程，
+                //而main则是如果当前是主线程会堵塞主线程直到订阅方法执行完毕
                 if (mainThreadPoster != null) {
                     mainThreadPoster.enqueue(subscription, event);
                 } else {
@@ -447,14 +565,14 @@ public class EventBus {
                     invokeSubscriber(subscription, event);
                 }
                 break;
-            case BACKGROUND:
-                if (isMainThread) {
+            case BACKGROUND://运行在后台线程(非主线程)
+                if (isMainThread) {//如果当前post发送方是主线程，进入后台线程排队
                     backgroundPoster.enqueue(subscription, event);
-                } else {
+                } else {//如果当前post发送方是后台线程，则直接堵塞该线程并执行
                     invokeSubscriber(subscription, event);
                 }
                 break;
-            case ASYNC:
+            case ASYNC://运行在异步线程，无论如何都另起线程来执行订阅方法，与post发送方所在线程不同
                 asyncPoster.enqueue(subscription, event);
                 break;
             default:
@@ -463,6 +581,13 @@ public class EventBus {
     }
 
     /** Looks up all Class objects including super classes and interfaces. Should also work for interfaces. */
+
+    /**
+     * 获取eventClass这个事件类，并递归获取其实现的接口、父类、父类实现的接口
+     *
+     * @param eventClass
+     * @return
+     */
     private static List<Class<?>> lookupAllEventTypes(Class<?> eventClass) {
         synchronized (eventTypesCache) {
             List<Class<?>> eventTypes = eventTypesCache.get(eventClass);
@@ -505,8 +630,15 @@ public class EventBus {
         }
     }
 
+    /**
+     * 反射执行订阅者方法
+     *
+     * @param subscription 订阅方法与订阅者对象
+     * @param event  事件，比如post("123")，即为"123"
+     */
     void invokeSubscriber(Subscription subscription, Object event) {
         try {
+            //反射执行订阅者对象subscription.subscriber(比如FirstActivity.this)中的方法subscription.subscriberMethod.method，入参为event
             subscription.subscriberMethod.method.invoke(subscription.subscriber, event);
         } catch (InvocationTargetException e) {
             handleSubscriberException(subscription, event, e.getCause());
